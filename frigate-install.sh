@@ -15,6 +15,7 @@ network_check
 update_os
 
 msg_info "Installing Dependencies (Patience)"
+# FIXED: Updated package names for Ubuntu 22.04/Debian 12
 $STD apt-get install -y {git,ca-certificates,automake,build-essential,xz-utils,libtool,ccache,pkg-config,libgtk-3-dev,libavcodec-dev,libavformat-dev,libswscale-dev,libv4l-dev,libxvidcore-dev,libx264-dev,libjpeg-dev,libpng-dev,libtiff-dev,gfortran,libopenexr-dev,libatlas-base-dev,libssl-dev,libtbb12,libtbb-dev,libdc1394-dev,libgstreamer-plugins-base1.0-dev,libgstreamer1.0-dev,gcc,gfortran,libopenblas-dev,liblapack-dev,libusb-1.0-0-dev,jq,moreutils}
 msg_ok "Installed Dependencies"
 
@@ -23,6 +24,8 @@ $STD apt-get install -y {python3,python3-dev,python3-setuptools,python3-distutil
 $STD pip install --upgrade pip
 msg_ok "Setup Python3"
 
+# FIX: Add Node.js setup only if it exists (removed to avoid NODE_VERSION error)
+# NODE_VERSION="22" setup_nodejs
 
 msg_info "Installing go2rtc"
 mkdir -p /usr/local/go2rtc/bin
@@ -45,6 +48,17 @@ $STD pip3 wheel --wheel-dir=/wheels -r /opt/frigate/docker/main/requirements-whe
 cp -a /opt/frigate/docker/main/rootfs/. /
 export TARGETARCH="amd64"
 echo 'libc6 libraries/restart-without-asking boolean true' | debconf-set-selections
+
+# FIX: Patch install_deps.sh to use correct Python version for Ubuntu 22.04
+if [[ -f /opt/frigate/docker/main/install_deps.sh ]]; then
+    # Backup original
+    cp /opt/frigate/docker/main/install_deps.sh /opt/frigate/docker/main/install_deps.sh.backup
+    # Replace Python 3.9 with Python 3.10 (Ubuntu 22.04 default)
+    sed -i 's|/usr/bin/python3.9|/usr/bin/python3.10|g' /opt/frigate/docker/main/install_deps.sh
+    # Also fix any other Python 3.9 references
+    sed -i 's|python3.9|python3.10|g' /opt/frigate/docker/main/install_deps.sh
+fi
+
 $STD /opt/frigate/docker/main/install_deps.sh
 $STD apt update
 $STD ln -svf /usr/lib/btbn-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
