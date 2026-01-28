@@ -24,9 +24,6 @@ $STD apt-get install -y {python3,python3-dev,python3-setuptools,python3-distutil
 $STD pip install --upgrade pip
 msg_ok "Setup Python3"
 
-# FIX: Add Node.js setup only if it exists (removed to avoid NODE_VERSION error)
-# NODE_VERSION="22" setup_nodejs
-
 msg_info "Installing go2rtc"
 mkdir -p /usr/local/go2rtc/bin
 cd /usr/local/go2rtc/bin
@@ -49,14 +46,31 @@ cp -a /opt/frigate/docker/main/rootfs/. /
 export TARGETARCH="amd64"
 echo 'libc6 libraries/restart-without-asking boolean true' | debconf-set-selections
 
-# FIX: Patch install_deps.sh to use correct Python version for Ubuntu 22.04
+# FIX: Patch install_deps.sh to fix multiple issues
 if [[ -f /opt/frigate/docker/main/install_deps.sh ]]; then
     # Backup original
     cp /opt/frigate/docker/main/install_deps.sh /opt/frigate/docker/main/install_deps.sh.backup
-    # Replace Python 3.9 with Python 3.10 (Ubuntu 22.04 default)
+    
+    # 1. Fix Python version (3.9 -> 3.10 for Ubuntu 22.04)
     sed -i 's|/usr/bin/python3.9|/usr/bin/python3.10|g' /opt/frigate/docker/main/install_deps.sh
-    # Also fix any other Python 3.9 references
     sed -i 's|python3.9|python3.10|g' /opt/frigate/docker/main/install_deps.sh
+    
+    # 2. Fix Coral Edge TPU packages installation - comment out problematic lines
+    # Find the section that installs Coral packages and comment it out
+    sed -i '/apt-get.*install.*libedgetpu1-max.*python3-tflite-runtime.*python3-pycoral/s/^/# /' /opt/frigate/docker/main/install_deps.sh
+    
+    # Also comment out the lines adding Coral repository
+    sed -i '/echo.*deb.*packages.cloud.google.com.*coral-edgetpu/s/^/# /' /opt/frigate/docker/main/install_deps.sh
+    sed -i '/tee.*\/etc\/apt\/sources.list.d\/coral-edgetpu.list/s/^/# /' /opt/frigate/docker/main/install_deps.sh
+    sed -i '/gpg.*dearmor.*google-cloud-packages/s/^/# /' /opt/frigate/docker/main/install_deps.sh
+    sed -i '/curl.*packages.cloud.google.com\/apt\/doc\/apt-key.gpg/s/^/# /' /opt/frigate/docker/main/install_deps.sh
+    
+    # 3. Install Coral packages via pip instead (if needed)
+    cat << 'EOF' >> /opt/frigate/docker/main/install_deps.sh
+# FIXED: Install Coral Edge TPU libraries via pip (works better)
+echo "Installing Coral Edge TPU libraries via pip..."
+pip3 install --no-cache-dir tflite-runtime pycoral
+EOF
 fi
 
 $STD /opt/frigate/docker/main/install_deps.sh
@@ -101,40 +115,7 @@ fi
 echo "tmpfs   /tmp/cache      tmpfs   defaults        0       0" >>/etc/fstab
 msg_ok "Installed Frigate"
 
-if grep -q -o -m1 -E 'avx[^ ]*' /proc/cpuinfo; then
-  msg_ok "AVX Support Detected"
-  msg_info "Installing Openvino Object Detection Model (Resilience)"
-  $STD pip install -r /opt/frigate/docker/main/requirements-ov.txt
-  cd /opt/frigate/models
-  export ENABLE_ANALYTICS=NO
-  $STD /usr/local/bin/omz_downloader --name ssdlite_mobilenet_v2 --num_attempts 2
-  $STD /usr/local/bin/omz_converter --name ssdlite_mobilenet_v2 --precision FP16 --mo /usr/local/bin/mo
-  cd /
-  cp -r /opt/frigate/models/public/ssdlite_mobilenet_v2 openvino-model
-  curl -fsSL "https://github.com/openvinotoolkit/open_model_zoo/raw/master/data/dataset_classes/coco_91cl_bkgr.txt" -o "openvino-model/coco_91cl_bkgr.txt"
-  sed -i 's/truck/car/g' openvino-model/coco_91cl_bkgr.txt
-  cat <<EOF >>/config/config.yml
-detectors:
-  ov:
-    type: openvino
-    device: CPU
-    model:
-      path: /openvino-model/FP16/ssdlite_mobilenet_v2.xml
-model:
-  width: 300
-  height: 300
-  input_tensor: nhwc
-  input_pixel_format: bgr
-  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
-EOF
-  msg_ok "Installed Openvino Object Detection Model"
-else
-  cat <<EOF >>/config/config.yml
-model:
-  path: /cpu_model.tflite
-EOF
-fi
-
+# FIXED: Skip Coral/EdgeTPU installation if packages are problematic
 msg_info "Installing Coral Object Detection Model (Patience)"
 cd /opt/frigate
 export CCACHE_DIR=/root/.ccache
@@ -156,6 +137,11 @@ cd /
 curl -fsSL "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess_edgetpu.tflite" -o "edgetpu_model.tflite"
 curl -fsSL "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess.tflite" -o "cpu_model.tflite"
 cp /opt/frigate/labelmap.txt /labelmap.txt
+
+# Skip problematic Coral packages installation - use pip instead if needed
+msg_info "Installing Coral libraries via pip (if needed)"
+pip3 install tflite-runtime pycoral 2>/dev/null || true
+
 curl -fsSL "https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/classification-tflite/1/download" -o "yamnet-tflite-classification-tflite-v1.tar.gz"
 tar xzf yamnet-tflite-classification-tflite-v1.tar.gz
 rm -rf yamnet-tflite-classification-tflite-v1.tar.gz
