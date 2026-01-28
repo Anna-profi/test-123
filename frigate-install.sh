@@ -16,11 +16,17 @@ update_os
 
 msg_info "Installing Dependencies (Patience)"
 # FIXED: Updated package names for Ubuntu 22.04/Debian 12
-$STD apt-get install -y {git,ca-certificates,automake,build-essential,xz-utils,libtool,ccache,pkg-config,libgtk-3-dev,libavcodec-dev,libavformat-dev,libswscale-dev,libv4l-dev,libxvidcore-dev,libx264-dev,libjpeg-dev,libpng-dev,libtiff-dev,gfortran,libopenexr-dev,libatlas-base-dev,libssl-dev,libtbb12,libtbb-dev,libdc1394-dev,libgstreamer-plugins-base1.0-dev,libgstreamer1.0-dev,gcc,gfortran,libopenblas-dev,liblapack-dev,libusb-1.0-0-dev,jq,moreutils}
+$STD apt-get install -y \
+  git ca-certificates automake build-essential xz-utils libtool ccache \
+  pkg-config libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev \
+  libv4l-dev libxvidcore-dev libx264-dev libjpeg-dev libpng-dev libtiff-dev \
+  gfortran libopenexr-dev libatlas-base-dev libssl-dev libtbb12 libtbb-dev \
+  libdc1394-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev gcc \
+  gfortran libopenblas-dev liblapack-dev libusb-1.0-0-dev jq moreutils
 msg_ok "Installed Dependencies"
 
 msg_info "Setup Python3"
-$STD apt-get install -y {python3,python3-dev,python3-setuptools,python3-distutils,python3-pip}
+$STD apt-get install -y python3 python3-dev python3-setuptools python3-distutils python3-pip
 $STD pip install --upgrade pip
 msg_ok "Setup Python3"
 
@@ -46,35 +52,23 @@ cp -a /opt/frigate/docker/main/rootfs/. /
 export TARGETARCH="amd64"
 echo 'libc6 libraries/restart-without-asking boolean true' | debconf-set-selections
 
-# FIX: Patch install_deps.sh to fix multiple issues
-if [[ -f /opt/frigate/docker/main/install_deps.sh ]]; then
-    # Backup original
-    cp /opt/frigate/docker/main/install_deps.sh /opt/frigate/docker/main/install_deps.sh.backup
-    
-    # 1. Fix Python version (3.9 -> 3.10 for Ubuntu 22.04)
-    sed -i 's|/usr/bin/python3.9|/usr/bin/python3.10|g' /opt/frigate/docker/main/install_deps.sh
-    sed -i 's|python3.9|python3.10|g' /opt/frigate/docker/main/install_deps.sh
-    
-    # 2. Fix Coral Edge TPU packages installation - comment out problematic lines
-    # Find the section that installs Coral packages and comment it out
-    sed -i '/apt-get.*install.*libedgetpu1-max.*python3-tflite-runtime.*python3-pycoral/s/^/# /' /opt/frigate/docker/main/install_deps.sh
-    
-    # Also comment out the lines adding Coral repository
-    sed -i '/echo.*deb.*packages.cloud.google.com.*coral-edgetpu/s/^/# /' /opt/frigate/docker/main/install_deps.sh
-    sed -i '/tee.*\/etc\/apt\/sources.list.d\/coral-edgetpu.list/s/^/# /' /opt/frigate/docker/main/install_deps.sh
-    sed -i '/gpg.*dearmor.*google-cloud-packages/s/^/# /' /opt/frigate/docker/main/install_deps.sh
-    sed -i '/curl.*packages.cloud.google.com\/apt\/doc\/apt-key.gpg/s/^/# /' /opt/frigate/docker/main/install_deps.sh
-    
-    # 3. Install Coral packages via pip instead (if needed)
-    cat << 'EOF' >> /opt/frigate/docker/main/install_deps.sh
-# FIXED: Install Coral Edge TPU libraries via pip (works better)
-echo "Installing Coral Edge TPU libraries via pip..."
-pip3 install --no-cache-dir tflite-runtime pycoral
-EOF
-fi
+# === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Вручную устанавливаем зависимости ===
+msg_info "Installing Frigate dependencies manually (bypassing problematic script)"
+$STD apt-get update
 
-$STD /opt/frigate/docker/main/install_deps.sh
-$STD apt update
+# Установка основных зависимостей из install_deps.sh (БЕЗ Coral)
+$STD apt-get install --no-install-recommends -y \
+  apt-transport-https gnupg wget procps vainfo unzip locales tzdata \
+  libxml2 xz-utils python3.10 python3-pip curl jq nethogs libfuse2 \
+  libva-wayland2 python3-llfuse libnuma1 ocl-icd-libopencl1 libva-drm2 \
+  libva-x11-2 libvdpau1 libxcb-shm0 libxcb-xfixes0
+
+# Устанавливаем Python 3.10 как альтернативу (исправление Python версии)
+update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# СОЗНАТЕЛЬНО ПРОПУСКАЕМ УСТАНОВКУ PACKAGES CORAL - они не обязательны
+msg_ok "Skipped problematic Coral packages (libedgetpu1-max, python3-tflite-runtime, python3-pycoral)"
+
 $STD ln -svf /usr/lib/btbn-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
 $STD ln -svf /usr/lib/btbn-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
 $STD pip3 install -U /wheels/*.whl
@@ -115,7 +109,43 @@ fi
 echo "tmpfs   /tmp/cache      tmpfs   defaults        0       0" >>/etc/fstab
 msg_ok "Installed Frigate"
 
-# FIXED: Skip Coral/EdgeTPU installation if packages are problematic
+# Проверяем наличие AVX перед установкой OpenVINO
+msg_info "Checking CPU for AVX support"
+if grep -q -o -m1 -E 'avx[^ ]*' /proc/cpuinfo; then
+  msg_ok "AVX Support Detected"
+  msg_info "Installing Openvino Object Detection Model (Resilience)"
+  $STD pip install -r /opt/frigate/docker/main/requirements-ov.txt
+  cd /opt/frigate/models
+  export ENABLE_ANALYTICS=NO
+  $STD /usr/local/bin/omz_downloader --name ssdlite_mobilenet_v2 --num_attempts 2
+  $STD /usr/local/bin/omz_converter --name ssdlite_mobilenet_v2 --precision FP16 --mo /usr/local/bin/mo
+  cd /
+  cp -r /opt/frigate/models/public/ssdlite_mobilenet_v2 openvino-model
+  curl -fsSL "https://github.com/openvinotoolkit/open_model_zoo/raw/master/data/dataset_classes/coco_91cl_bkgr.txt" -o "openvino-model/coco_91cl_bkgr.txt"
+  sed -i 's/truck/car/g' openvino-model/coco_91cl_bkgr.txt
+  cat <<EOF >>/config/config.yml
+detectors:
+  ov:
+    type: openvino
+    device: CPU
+    model:
+      path: /openvino-model/FP16/ssdlite_mobilenet_v2.xml
+model:
+  width: 300
+  height: 300
+  input_tensor: nhwc
+  input_pixel_format: bgr
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+EOF
+  msg_ok "Installed Openvino Object Detection Model"
+else
+  cat <<EOF >>/config/config.yml
+model:
+  path: /cpu_model.tflite
+EOF
+  msg_info "CPU does not support AVX, using CPU model only"
+fi
+
 msg_info "Installing Coral Object Detection Model (Patience)"
 cd /opt/frigate
 export CCACHE_DIR=/root/.ccache
@@ -138,9 +168,12 @@ curl -fsSL "https://github.com/google-coral/test_data/raw/release-frogfish/ssdli
 curl -fsSL "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess.tflite" -o "cpu_model.tflite"
 cp /opt/frigate/labelmap.txt /labelmap.txt
 
-# Skip problematic Coral packages installation - use pip instead if needed
-msg_info "Installing Coral libraries via pip (if needed)"
-pip3 install tflite-runtime pycoral 2>/dev/null || true
+# Устанавливаем Coral библиотеки через pip (если возможно)
+msg_info "Installing Coral libraries via pip (optional)"
+pip3 install tflite-runtime pycoral 2>/dev/null || {
+  msg_warn "Coral libraries could not be installed via pip - continuing without Coral support"
+  echo "Note: Coral EdgeTPU support is optional. You can add it later if needed."
+}
 
 curl -fsSL "https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/classification-tflite/1/download" -o "yamnet-tflite-classification-tflite-v1.tar.gz"
 tar xzf yamnet-tflite-classification-tflite-v1.tar.gz
