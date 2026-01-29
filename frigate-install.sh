@@ -93,7 +93,7 @@ apt-get install -y \
         libavcodec-dev libavformat-dev libswscale-dev \
         libv4l-dev libxvidcore-dev libx264-dev \
         libgtk-3-dev libtbb12 libtbb-dev \
-        libdc1394-22-dev libopenexr-dev \          
+        libdc1394-dev libopenexr-dev \          
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
         libxine2-dev \                          # libavresample-dev УДАЛЁН (устарел в FFmpeg 5.x)
         libfaac-dev libmp3lame-dev libtheora-dev \
