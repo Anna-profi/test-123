@@ -86,16 +86,16 @@ install_dependencies() {
     log_info "Installing system dependencies"
     
     # Install essential packages
-    apt-get install -y \
+apt-get install -y \
         curl wget git build-essential \
         python3 python3-pip python3-venv python3-dev \
         libjpeg-dev libpng-dev libtiff-dev \
         libavcodec-dev libavformat-dev libswscale-dev \
         libv4l-dev libxvidcore-dev libx264-dev \
         libgtk-3-dev libtbb12 libtbb-dev \
-        libdc1394-dev libopenexr-dev \
+        libdc1394-22-dev libopenexr-dev \          
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-        libavresample-dev libxine2-dev \
+        libxine2-dev \                          # libavresample-dev УДАЛЁН (устарел в FFmpeg 5.x)
         libfaac-dev libmp3lame-dev libtheora-dev \
         libvorbis-dev libopencore-amrnb-dev libopencore-amrwb-dev \
         libopenblas-dev libatlas-base-dev libblas-dev \
@@ -104,20 +104,18 @@ install_dependencies() {
         libgoogle-glog-dev libgflags-dev \
         libsm6 libxext6 libxrender-dev \
         libgl1-mesa-glx libgl1-mesa-dri \
-        libtiff5-dev libjasper-dev libilmbase-dev \
+        libtiff5-dev libilmbase-dev \           # libjasper-dev УДАЛЁН (недоступен в репозиториях)
         libopenexr-dev libgdal-dev \
-        libdc1394-22-dev libv4l-dev \
+        libv4l-dev \                            # libdc1394-22-dev УДАЛЁН (уже есть libdc1394-dev выше)
         libxine2-dev libtbb-dev \
-        qt5-default libvtk6-dev \
-        zlib1g-dev libjpeg-dev \
+        zlib1g-dev libjpeg-dev \                # qt5-default и libvtk6-dev УДАЛЕНЫ (не обязательны для Frigate)
         libwebp-dev libpng-dev \
-        libtiff5-dev libjasper-dev \
-        libopenexr-dev libgdal-dev \
-        libdc1394-22-dev libv4l-dev \
+        libtiff5-dev libopenexr-dev libgdal-dev \
+        libv4l-dev \
         libxine2-dev libtbb-dev \
         libavcodec-dev libavformat-dev \
         libswscale-dev libavutil-dev \
-        libpostproc-dev libavresample-dev \
+        libpostproc-dev \                       # libavresample-dev УДАЛЁН (дублирует удаление выше)
         libx264-dev libx265-dev \
         libnuma-dev libvpx-dev \
         libaom-dev libdav1d-dev \
@@ -246,8 +244,7 @@ install_dependencies() {
         libnfnetlink-dev \
         libipset-dev \
         libnftnl-dev \
-        libebtables-dev \
-        libnfsidmap-dev \
+        libnfsidmap-dev \                        # libebtables-dev УДАЛЁН
         libtirpc-dev \
         libkrb5-dev \
         libgssapi-krb5-2 \
@@ -260,8 +257,7 @@ install_dependencies() {
         libbson-dev \
         libhiredis-dev \
         libmemcached-dev \
-        libcouchbase-dev \
-        librabbitmq-dev \
+        librabbitmq-dev \                        # libcouchbase-dev УДАЛЁН
         libzmq3-dev \
         libnanomsg-dev \
         libcurl4-openssl-dev \
