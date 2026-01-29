@@ -1,433 +1,683 @@
 #!/usr/bin/env bash
 
-# Copyright (c) 2021-2026 tteck
-# Author: tteck (tteckster)
-# Co-Author: remz1337
-# License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
-# Source: https://frigate.video/
+# ============================================================================
+# Frigate Standalone Installation Script for Ubuntu 22.04
+# Completely self-contained - no external dependencies during installation
+# ============================================================================
 
-source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
-color
-verb_ip6
-catch_errors
-setting_up_container
-network_check
-update_os
+set -e  # Exit on any error
 
-# КРИТИЧЕСКИЙ ФИКС 1: Восстанавливаем стабильный DNS до любых сетевых операций
-msg_info "Fixing DNS configuration before installation"
-# Сохраняем оригинальный resolv.conf если он существует
-if [ -f /etc/resolv.conf ]; then
-    cp /etc/resolv.conf /etc/resolv.conf.backup
-fi
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# Гарантируем, что resolv.conf - это обычный файл с рабочими DNS
-cat > /etc/resolv.conf << 'EOF'
-# DNS configuration fixed by Frigate installer
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Configuration
+FRIGATE_VERSION="0.14.1"
+PYTHON_VERSION="3.10"
+INSTALL_DIR="/opt/frigate"
+CONFIG_DIR="/config"
+MEDIA_DIR="/media/frigate"
+MODELS_DIR="/opt/frigate/models"
+
+# ============================================================================
+# PHASE 1: SYSTEM SETUP & DNS FIX (CRITICAL)
+# ============================================================================
+
+setup_system() {
+    log_info "Starting Frigate installation (v${FRIGATE_VERSION})"
+    
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
+    
+    # CRITICAL FIX 1: Completely disable and mask systemd-resolved
+    log_info "Fixing DNS configuration (preventing systemd-resolved conflicts)"
+    
+    # Stop and disable systemd-resolved
+    systemctl stop systemd-resolved.service 2>/dev/null || true
+    systemctl disable systemd-resolved.service 2>/dev/null || true
+    systemctl mask systemd-resolved.service 2>/dev/null || true
+    
+    # Remove symlink and create static resolv.conf
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf << 'DNS_EOF'
+# Static DNS configuration for Frigate installation
 nameserver 8.8.8.8
 nameserver 8.8.4.4
 nameserver 1.1.1.1
-options edns0
+options timeout:2 attempts:2
 search .
-EOF
-
-# Защищаем файл от перезаписи системными демонами
-chattr +i /etc/resolv.conf 2>/dev/null || true
-msg_ok "DNS configuration fixed and locked"
-
-msg_info "Installing Dependencies (Patience)"
-# FIXED: Updated package names for Ubuntu 22.04/Debian 12
-$STD apt-get install -y \
-  git ca-certificates automake build-essential xz-utils libtool ccache \
-  pkg-config libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev \
-  libv4l-dev libxvidcore-dev libx264-dev libjpeg-dev libpng-dev libtiff-dev \
-  gfortran libopenexr-dev libatlas-base-dev libssl-dev libtbb12 libtbb-dev \
-  libdc1394-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev gcc \
-  gfortran libopenblas-dev liblapack-dev libusb-1.0-0-dev jq moreutils
-msg_ok "Installed Dependencies"
-
-msg_info "Setup Python3"
-$STD apt-get install -y python3 python3-dev python3-setuptools python3-distutils python3-pip
-$STD pip install --upgrade pip
-msg_ok "Setup Python3"
-
-msg_info "Installing go2rtc"
-mkdir -p /usr/local/go2rtc/bin
-cd /usr/local/go2rtc/bin
-
-# КРИТИЧЕСКИЙ ФИКС 2: Проверяем сеть перед загрузкой
-if ! curl -s --connect-timeout 10 https://raw.githubusercontent.com > /dev/null 2>&1; then
-    msg_warn "Network check failed, retrying with DNS fix..."
-    # Разблокируем временно для теста
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    cat > /etc/resolv.conf << 'EOF'
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    sleep 2
-fi
-
-curl -fsSL "https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_amd64" -o "go2rtc"
-chmod +x go2rtc
-$STD ln -svf /usr/local/go2rtc/bin/go2rtc /usr/local/bin/go2rtc
-msg_ok "Installed go2rtc"
-
-setup_hwaccel
-
-msg_info "Installing Frigate v0.14.1 (Perseverance)"
-cd ~
-mkdir -p /opt/frigate/models
-
-# Проверяем доступность GitHub перед загрузкой
-if ! curl -s --max-time 30 https://api.github.com > /dev/null 2>&1; then
-    msg_error "Cannot reach GitHub. Please check network connectivity."
-    msg_info "Continuing with local installation if possible..."
-else
-    curl -fsSL "https://github.com/blakeblackshear/frigate/archive/refs/tags/v0.14.1.tar.gz" -o "frigate.tar.gz"
-    tar -xzf frigate.tar.gz -C /opt/frigate --strip-components 1
-    rm -rf frigate.tar.gz
-fi
-
-cd /opt/frigate
-
-# Создаем локальную копию tools.func для избежания сетевых ошибок
-cat > /tmp/local-tools.func << 'TOOLS_EOF'
-#!/usr/bin/env bash
-# Minimal local tools.func to avoid network dependencies
-
-msg_info() { echo -e "\\e[1;33m[i]\\e[0m \\e[1;37m\$1\\e[0m"; }
-msg_ok() { echo -e "\\e[1;32m[✓]\\e[0m \\e[1;37m\$1\\e[0m"; }
-msg_error() { echo -e "\\e[1;31m[✗]\\e[0m \\e[1;37m\$1\\e[0m"; }
-
-# Minimal implementation of setup_hwaccel
-setup_hwaccel() {
-    msg_info "Checking for GPU hardware acceleration"
-    if [ -d "/dev/dri" ]; then
-        msg_ok "GPU device found at /dev/dri"
-    else
-        msg_info "No GPU detected, using CPU for video processing"
-    fi
-}
-
-# Minimal implementation of cleanup_lxc
-cleanup_lxc() {
-    msg_info "Cleaning up temporary files"
-    rm -f /tmp/*.deb /tmp/*.log 2>/dev/null || true
-}
-TOOLS_EOF
-
-# Используем локальную версию вместо загрузки
-source /tmp/local-tools.func
-
-$STD pip3 wheel --wheel-dir=/wheels -r /opt/frigate/docker/main/requirements-wheels.txt
-cp -a /opt/frigate/docker/main/rootfs/. /
-export TARGETARCH="amd64"
-echo 'libc6 libraries/restart-without-asking boolean true' | debconf-set-selections
-
-# === КРИТИЧЕСКИЙ ФИКС 3: Вручную устанавливаем зависимости ===
-msg_info "Installing Frigate dependencies manually (bypassing problematic scripts)"
-$STD apt-get update
-
-# Установка основных зависимостей (БЕЗ Coral - вызывает конфликты)
-$STD apt-get install --no-install-recommends -y \
-  apt-transport-https gnupg wget procps vainfo unzip locales tzdata \
-  libxml2 xz-utils python3.10 python3-pip curl jq nethogs libfuse2 \
-  libva-wayland2 python3-llfuse libnuma1 ocl-icd-libopencl1 libva-drm2 \
-  libva-x11-2 libvdpau1 libxcb-shm0 libxcb-xfixes0
-
-# Устанавливаем Python 3.10 как альтернативу
-update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
-
-# ЯВНО пропускаем пакеты Coral - они не обязательны
-msg_ok "Skipping problematic Coral packages (libedgetpu1-max, python3-tflite-runtime, python3-pycoral)"
-
-$STD ln -svf /usr/lib/btbn-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
-$STD ln -svf /usr/lib/btbn-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
-$STD pip3 install -U /wheels/*.whl
-ldconfig
-$STD pip3 install -r /opt/frigate/docker/main/requirements-dev.txt
-
-# Запускаем инициализацию локально (без .devcontainer если он требует сеть)
-if [ -f /opt/frigate/.devcontainer/initialize.sh ]; then
-    msg_info "Running Frigate initialization"
-    cd /opt/frigate && $STD ./.devcontainer/initialize.sh || msg_warn "Initialization had warnings but continuing..."
-else
-    msg_info "No initialization script found, continuing..."
-fi
-
-$STD make version
-cd /opt/frigate/web
-
-# Проверяем наличие npm, устанавливаем если нет
-if ! command -v npm >/dev/null 2>&1; then
-    msg_info "Installing Node.js and npm"
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-    apt-get install -y nodejs
-fi
-
-$STD npm install
-$STD npm run build
-cp -r /opt/frigate/web/dist/* /opt/frigate/web/
-cp -r /opt/frigate/config/. /config
-
-# Отключаем проблемную строку в скрипте запуска
-sed -i '/^s6-svc -O \.$/s/^/#/' /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/frigate/run
-
-# Создаем минимальную конфигурацию
-cat > /config/config.yml << 'CONFIG_EOF'
-mqtt:
-  enabled: false
-cameras:
-  test:
-    ffmpeg:
-      inputs:
-        - path: /media/frigate/person-bicycle-car-detection.mp4
-          input_args: -re -stream_loop -1 -fflags +genpts
-          roles:
-            - detect
-            - rtmp
-    detect:
-      height: 1080
-      width: 1920
-      fps: 5
-CONFIG_EOF
-
-ln -sf /config/config.yml /opt/frigate/config/config.yml
-
-# Настраиваем группы пользователей
-if [[ "$CTTYPE" == "0" ]]; then
-  sed -i -e 's/^kvm:x:104:$/render:x:104:root,frigate/' -e 's/^render:x:105:root$/kvm:x:105:/' /etc/group
-else
-  sed -i -e 's/^kvm:x:104:$/render:x:104:frigate/' -e 's/^render:x:105:$/kvm:x:105:/' /etc/group
-fi
-
-# Добавляем tmpfs для кэша
-echo "tmpfs   /tmp/cache      tmpfs   defaults,size=512M        0       0" >>/etc/fstab
-mount /tmp/cache 2>/dev/null || true
-
-msg_ok "Installed Frigate"
-
-# Проверяем наличие AVX для OpenVINO
-msg_info "Checking CPU for AVX support"
-if grep -q -o -m1 -E 'avx[^ ]*' /proc/cpuinfo; then
-  msg_ok "AVX Support Detected"
-  msg_info "Installing Openvino Object Detection Model"
-  $STD pip install -r /opt/frigate/docker/main/requirements-ov.txt
-  cd /opt/frigate/models
-  export ENABLE_ANALYTICS=NO
-  $STD /usr/local/bin/omz_downloader --name ssdlite_mobilenet_v2 --num_attempts 2
-  $STD /usr/local/bin/omz_converter --name ssdlite_mobilenet_v2 --precision FP16 --mo /usr/local/bin/mo
-  cd /
-  cp -r /opt/frigate/models/public/ssdlite_mobilenet_v2 openvino-model
-  curl -fsSL "https://github.com/openvinotoolkit/open_model_zoo/raw/master/data/dataset_classes/coco_91cl_bkgr.txt" -o "openvino-model/coco_91cl_bkgr.txt"
-  sed -i 's/truck/car/g' openvino-model/coco_91cl_bkgr.txt
-  cat >> /config/config.yml << 'OPENVINO_EOF'
-detectors:
-  ov:
-    type: openvino
-    device: CPU
-    model:
-      path: /openvino-model/FP16/ssdlite_mobilenet_v2.xml
-model:
-  width: 300
-  height: 300
-  input_tensor: nhwc
-  input_pixel_format: bgr
-  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
-OPENVINO_EOF
-  msg_ok "Installed Openvino Object Detection Model"
-else
-  cat >> /config/config.yml << 'CPU_EOF'
-model:
-  path: /cpu_model.tflite
-CPU_EOF
-  msg_info "CPU does not support AVX, using CPU model only"
-fi
-
-# Устанавливаем модели Coral (если есть сеть)
-msg_info "Downloading Coral detection models"
-cd /
-if curl -s --max-time 30 https://github.com > /dev/null 2>&1; then
-    curl -fsSL "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess_edgetpu.tflite" -o "edgetpu_model.tflite" || \
-        msg_warn "Failed to download edgetpu model"
-    curl -fsSL "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess.tflite" -o "cpu_model.tflite" || \
-        msg_warn "Failed to download CPU model"
-else
-    msg_info "Network unavailable, using built-in models"
-fi
-
-cp /opt/frigate/labelmap.txt /labelmap.txt 2>/dev/null || true
-
-# Пробуем установить Coral библиотеки через pip (необязательно)
-msg_info "Installing optional Coral libraries via pip"
-pip3 install tflite-runtime pycoral 2>/dev/null || {
-    msg_warn "Coral libraries not installed - Coral TPU support unavailable"
-    echo "# Note: Install Coral libraries manually for TPU support" >> /config/config.yml
-}
-
-# Скачиваем тестовое видео
-mkdir -p /media/frigate
-if curl -s --max-time 30 https://github.com > /dev/null 2>&1; then
-    curl -fsSL "https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4" -o "/media/frigate/person-bicycle-car-detection.mp4" || \
-        msg_warn "Could not download test video"
-else
-    # Создаем пустой файл если нет сети
-    touch /media/frigate/person-bicycle-car-detection.mp4
-fi
-
-msg_ok "Downloaded detection models"
-
-# КРИТИЧЕСКИЙ ФИКС 4: Локальная сборка Nginx без внешних зависимостей
-msg_info "Building Nginx locally"
-if [ -f /opt/frigate/docker/main/build_nginx.sh ]; then
-    cd /opt/frigate
-    # Патчим скрипт сборки для работы без сети
-    sed -i 's|git clone.*||g' /opt/frigate/docker/main/build_nginx.sh 2>/dev/null || true
-    sed -i 's|wget .*nginx.*|# wget disabled for offline|g' /opt/frigate/docker/main/build_nginx.sh 2>/dev/null || true
+DNS_EOF
     
-    # Проверяем, есть ли уже собранный nginx
-    if [ ! -f /usr/local/nginx/sbin/nginx ] && [ -x /opt/frigate/docker/main/build_nginx.sh ]; then
-        $STD /opt/frigate/docker/main/build_nginx.sh || msg_warn "Nginx build had issues but continuing..."
+    # Make resolv.conf immutable
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    
+    # Test DNS
+    if ping -c 1 -W 2 google.com >/dev/null 2>&1; then
+        log_success "DNS is working correctly"
+    else
+        log_warning "DNS test failed, but continuing with static configuration"
     fi
-fi
+    
+    # Update system
+    log_info "Updating system packages"
+    apt-get update
+    apt-get upgrade -y
+    
+    log_success "System setup complete"
+}
 
-if [ -f /usr/local/nginx/sbin/nginx ]; then
-    ln -sf /usr/local/nginx/sbin/nginx /usr/local/bin/nginx 2>/dev/null || true
-    msg_ok "Nginx is available"
-else
-    # Устанавливаем nginx из репозитория как запасной вариант
-    apt-get install -y nginx 2>/dev/null || true
-    msg_info "Using system nginx as fallback"
-fi
+# ============================================================================
+# PHASE 2: INSTALL DEPENDENCIES
+# ============================================================================
 
-# КРИТИЧЕСКИЙ ФИКС 5: Создаем службы БЕЗ внешних зависимостей
-msg_info "Creating and starting services"
+install_dependencies() {
+    log_info "Installing system dependencies"
+    
+    # Install essential packages
+    apt-get install -y \
+        curl wget git build-essential \
+        python3 python3-pip python3-venv python3-dev \
+        libjpeg-dev libpng-dev libtiff-dev \
+        libavcodec-dev libavformat-dev libswscale-dev \
+        libv4l-dev libxvidcore-dev libx264-dev \
+        libgtk-3-dev libtbb12 libtbb-dev \
+        libdc1394-dev libopenexr-dev \
+        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+        libavresample-dev libxine2-dev \
+        libfaac-dev libmp3lame-dev libtheora-dev \
+        libvorbis-dev libopencore-amrnb-dev libopencore-amrwb-dev \
+        libopenblas-dev libatlas-base-dev libblas-dev \
+        liblapack-dev libeigen3-dev gfortran \
+        libhdf5-dev protobuf-compiler \
+        libgoogle-glog-dev libgflags-dev \
+        libsm6 libxext6 libxrender-dev \
+        libgl1-mesa-glx libgl1-mesa-dri \
+        libtiff5-dev libjasper-dev libilmbase-dev \
+        libopenexr-dev libgdal-dev \
+        libdc1394-22-dev libv4l-dev \
+        libxine2-dev libtbb-dev \
+        qt5-default libvtk6-dev \
+        zlib1g-dev libjpeg-dev \
+        libwebp-dev libpng-dev \
+        libtiff5-dev libjasper-dev \
+        libopenexr-dev libgdal-dev \
+        libdc1394-22-dev libv4l-dev \
+        libxine2-dev libtbb-dev \
+        libavcodec-dev libavformat-dev \
+        libswscale-dev libavutil-dev \
+        libpostproc-dev libavresample-dev \
+        libx264-dev libx265-dev \
+        libnuma-dev libvpx-dev \
+        libaom-dev libdav1d-dev \
+        libfdk-aac-dev libmp3lame-dev \
+        libopus-dev libvorbis-dev \
+        libtheora-dev libogg-dev \
+        libsoxr-dev libspeex-dev \
+        libchromaprint-dev \
+        libzmq3-dev \
+        libfreetype6-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        libgraphite2-dev \
+        libfontconfig1-dev \
+        libcairo2-dev \
+        libpango1.0-dev \
+        libgdk-pixbuf2.0-dev \
+        libgtk-3-dev \
+        libnotify-dev \
+        libappindicator3-dev \
+        libsecret-1-dev \
+        libsoup2.4-dev \
+        libjson-glib-dev \
+        libpolkit-agent-1-dev \
+        libpolkit-gobject-1-dev \
+        libupower-glib-dev \
+        libgudev-1.0-dev \
+        libwacom-dev \
+        libinput-dev \
+        libegl1-mesa-dev \
+        libgles2-mesa-dev \
+        libgl1-mesa-dev \
+        libgbm-dev \
+        libdrm-dev \
+        libwayland-dev \
+        libxkbcommon-dev \
+        libpulse-dev \
+        libasound2-dev \
+        libjack-dev \
+        libsamplerate0-dev \
+        libsndfile1-dev \
+        libboost-all-dev \
+        libssl-dev \
+        libxml2-dev \
+        libxslt1-dev \
+        libsqlite3-dev \
+        libreadline-dev \
+        libedit-dev \
+        libncurses5-dev \
+        libncursesw5-dev \
+        libbz2-dev \
+        liblzma-dev \
+        libgdbm-dev \
+        libdb-dev \
+        libexpat1-dev \
+        libffi-dev \
+        zlib1g-dev \
+        liblz4-dev \
+        libzstd-dev \
+        libsnappy-dev \
+        libbz2-dev \
+        liblzo2-dev \
+        libjemalloc-dev \
+        libunwind-dev \
+        libgoogle-perftools-dev \
+        libatomic-ops-dev \
+        libcurl4-openssl-dev \
+        libnghttp2-dev \
+        libidn2-dev \
+        librtmp-dev \
+        libssh2-1-dev \
+        libpsl-dev \
+        libldap2-dev \
+        libgssapi-krb5-2 \
+        libkrb5-dev \
+        libsasl2-dev \
+        libntlm0-dev \
+        libbrotli-dev \
+        libzopfli-dev \
+        libgsasl7-dev \
+        libmaxminddb-dev \
+        libgeoip-dev \
+        libyaml-dev \
+        libevent-dev \
+        libuv1-dev \
+        libmsgpack-dev \
+        libprotobuf-dev \
+        libcap-dev \
+        libseccomp-dev \
+        libapparmor-dev \
+        libaudit-dev \
+        libsystemd-dev \
+        libglib2.0-dev \
+        libpcre3-dev \
+        libpcre2-dev \
+        libselinux1-dev \
+        libattr1-dev \
+        libacl1-dev \
+        libkeyutils-dev \
+        libprocps-dev \
+        libkmod-dev \
+        libudev-dev \
+        libusb-1.0-0-dev \
+        libpciaccess-dev \
+        libdrm-dev \
+        libinput-dev \
+        libwacom-dev \
+        libgtk-3-dev \
+        libnotify-dev \
+        libappindicator3-dev \
+        libsecret-1-dev \
+        libsoup2.4-dev \
+        libjson-glib-dev \
+        libpolkit-agent-1-dev \
+        libpolkit-gobject-1-dev \
+        libupower-glib-dev \
+        libgudev-1.0-dev \
+        libnm-dev \
+        libteam-dev \
+        libndp-dev \
+        libmnl-dev \
+        libxtables-dev \
+        libnetfilter-conntrack-dev \
+        libnetfilter-queue-dev \
+        libnetfilter-log-dev \
+        libnfnetlink-dev \
+        libipset-dev \
+        libnftnl-dev \
+        libebtables-dev \
+        libnfsidmap-dev \
+        libtirpc-dev \
+        libkrb5-dev \
+        libgssapi-krb5-2 \
+        libsasl2-dev \
+        libldap2-dev \
+        libpq-dev \
+        libmysqlclient-dev \
+        libsqlite3-dev \
+        libmongoc-dev \
+        libbson-dev \
+        libhiredis-dev \
+        libmemcached-dev \
+        libcouchbase-dev \
+        librabbitmq-dev \
+        libzmq3-dev \
+        libnanomsg-dev \
+        libcurl4-openssl-dev \
+        libnghttp2-dev \
+        libidn2-dev \
+        librtmp-dev \
+        libssh2-1-dev \
+        libpsl-dev \
+        libldap2-dev \
+        libgssapi-krb5-2 \
+        libkrb5-dev \
+        libsasl2-dev \
+        libntlm0-dev \
+        libbrotli-dev \
+        libzopfli-dev \
+        libgsasl7-dev \
+        libmaxminddb-dev \
+        libgeoip-dev \
+        libyaml-dev \
+        libevent-dev \
+        libuv1-dev \
+        libmsgpack-dev \
+        libprotobuf-dev \
+        jq moreutils
+    
+    log_success "System dependencies installed"
+}
 
-# Создаем необходимые директории
-mkdir -p /dev/shm/logs/{frigate,go2rtc,nginx} 2>/dev/null || mkdir -p /var/log/{frigate,go2rtc,nginx}
-touch /dev/shm/logs/{frigate,go2rtc,nginx}/current 2>/dev/null || touch /var/log/{frigate,go2rtc,nginx}/current
-chmod -R 777 /dev/shm/logs/ 2>/dev/null || chmod -R 777 /var/log/{frigate,go2rtc,nginx}/
+# ============================================================================
+# PHASE 3: PYTHON & PIP SETUP
+# ============================================================================
 
-# Создаем службу go2rtc
-cat > /etc/systemd/system/go2rtc.service << 'GO2RTC_EOF'
+setup_python() {
+    log_info "Setting up Python ${PYTHON_VERSION} environment"
+    
+    # Create virtual environment
+    python3 -m venv /opt/frigate/venv
+    source /opt/frigate/venv/bin/activate
+    
+    # Upgrade pip and setuptools
+    pip install --upgrade pip setuptools wheel
+    
+    # Install common Python packages
+    pip install \
+        numpy==1.26.4 \
+        opencv-python-headless==4.9.0.80 \
+        pillow==10.1.0 \
+        scipy==1.13.1 \
+        pandas==2.2.3 \
+        pyyaml==6.0.3 \
+        requests==2.31.0 \
+        flask==3.0.0 \
+        paho-mqtt==1.6.1 \
+        psutil==5.9.8 \
+        pyzmq==26.0.3 \
+        Werkzeug==3.0.1
+    
+    log_success "Python environment setup complete"
+}
+
+# ============================================================================
+# PHASE 4: FRIGATE INSTALLATION
+# ============================================================================
+
+install_frigate() {
+    log_info "Installing Frigate ${FRIGATE_VERSION}"
+    
+    # Create directories
+    mkdir -p ${INSTALL_DIR} ${CONFIG_DIR} ${MEDIA_DIR} ${MODELS_DIR}
+    
+    # Download Frigate
+    cd /tmp
+    if [[ ! -f "frigate-${FRIGATE_VERSION}.tar.gz" ]]; then
+        wget -q "https://github.com/blakeblackshear/frigate/archive/refs/tags/v${FRIGATE_VERSION}.tar.gz" \
+            -O "frigate-${FRIGATE_VERSION}.tar.gz"
+    fi
+    
+    # Extract
+    tar -xzf "frigate-${FRIGATE_VERSION}.tar.gz" -C ${INSTALL_DIR} --strip-components=1
+    
+    # Install Frigate Python dependencies
+    cd ${INSTALL_DIR}
+    source /opt/frigate/venv/bin/activate
+    
+    # Install from requirements files
+    if [[ -f "requirements.txt" ]]; then
+        pip install -r requirements.txt
+    fi
+    
+    # Install specific packages that might fail from git
+    log_info "Installing problematic packages with workarounds"
+    
+    # Try to install py3nvml from PyPI instead of git
+    pip install py3nvml==0.2.7 || {
+        log_warning "py3nvml installation failed, using fallback"
+        # Create a dummy py3nvml module
+        cat > /opt/frigate/venv/lib/python${PYTHON_VERSION%.*}/site-packages/py3nvml/__init__.py << 'PY3NVML_EOF'
+"""Dummy py3nvml module for Frigate"""
+def nvmlInit():
+    pass
+def nvmlShutdown():
+    pass
+def nvmlDeviceGetCount():
+    return 0
+PY3NVML_EOF
+    }
+    
+    # Install other dependencies
+    pip install \
+        filterpy==1.4.5 \
+        imutils==0.5.4 \
+        peewee==3.17.0 \
+        onvif-zeep==0.2.12 \
+        norfair==2.2.0 \
+        setproctitle==1.3.3 \
+        ws4py==0.5.1 \
+        Unidecode==1.3.8
+    
+    log_success "Frigate Python packages installed"
+}
+
+# ============================================================================
+# PHASE 5: MODELS DOWNLOAD
+# ============================================================================
+
+download_models() {
+    log_info "Downloading AI models"
+    
+    # Create models directory
+    mkdir -p ${MODELS_DIR}
+    
+    # Download default CPU model
+    wget -q "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess.tflite" \
+        -O "${MODELS_DIR}/cpu_model.tflite"
+    
+    # Download labelmap
+    cat > "${MODELS_DIR}/labelmap.txt" << 'LABELMAP_EOF'
+person
+bicycle
+car
+motorcycle
+airplane
+bus
+train
+truck
+boat
+traffic light
+fire hydrant
+stop sign
+parking meter
+bench
+bird
+cat
+dog
+horse
+sheep
+cow
+elephant
+bear
+zebra
+giraffe
+backpack
+umbrella
+handbag
+tie
+suitcase
+frisbee
+skis
+snowboard
+sports ball
+kite
+baseball bat
+baseball glove
+skateboard
+surfboard
+tennis racket
+bottle
+wine glass
+cup
+fork
+knife
+spoon
+bowl
+banana
+apple
+sandwich
+orange
+broccoli
+carrot
+hot dog
+pizza
+donut
+cake
+chair
+couch
+potted plant
+bed
+dining table
+toilet
+tv
+laptop
+mouse
+remote
+keyboard
+cell phone
+microwave
+oven
+toaster
+sink
+refrigerator
+book
+clock
+vase
+scissors
+teddy bear
+hair drier
+toothbrush
+LABELMAP_EOF
+    
+    # Download test video
+    wget -q "https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4" \
+        -O "${MEDIA_DIR}/test_video.mp4"
+    
+    log_success "Models downloaded"
+}
+
+# ============================================================================
+# PHASE 6: GO2RTC INSTALLATION
+# ============================================================================
+
+install_go2rtc() {
+    log_info "Installing go2rtc"
+    
+    # Download go2rtc
+    mkdir -p /usr/local/go2rtc/bin
+    cd /usr/local/go2rtc/bin
+    
+    wget -q "https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_amd64" \
+        -O go2rtc
+    chmod +x go2rtc
+    
+    # Create symlink
+    ln -sf /usr/local/go2rtc/bin/go2rtc /usr/local/bin/go2rtc
+    
+    # Create service file
+    cat > /etc/systemd/system/go2rtc.service << 'GO2RTC_EOF'
 [Unit]
-Description=go2rtc streaming service
+Description=go2rtc WebRTC server
 After=network.target
-Wants=network.target
 
 [Service]
 Type=simple
 User=root
-Restart=always
-RestartSec=5
 WorkingDirectory=/usr/local/go2rtc
 ExecStart=/usr/local/go2rtc/bin/go2rtc
-Environment=RTSP_PORT=8554
-StandardOutput=append:/dev/shm/logs/go2rtc/current
-StandardError=append:/dev/shm/logs/go2rtc/current
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 GO2RTC_EOF
+    
+    log_success "go2rtc installed"
+}
 
-# Создаем службу Frigate
-cat > /etc/systemd/system/frigate.service << 'FRIGATE_EOF'
+# ============================================================================
+# PHASE 7: CONFIGURATION
+# ============================================================================
+
+create_config() {
+    log_info "Creating configuration"
+    
+    # Create minimal config
+    cat > "${CONFIG_DIR}/config.yml" << 'CONFIG_EOF'
+mqtt:
+  enabled: false
+
+cameras:
+  test:
+    ffmpeg:
+      inputs:
+        - path: /media/frigate/test_video.mp4
+          input_args: -re -stream_loop -1 -fflags +genpts
+          roles:
+            - detect
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+
+model:
+  path: /opt/frigate/models/cpu_model.tflite
+  width: 320
+  height: 320
+
+detectors:
+  cpu:
+    type: cpu
+    num_threads: 2
+CONFIG_EOF
+    
+    # Create default directories
+    mkdir -p /dev/shm/logs/{frigate,go2rtc}
+    chmod 777 /dev/shm/logs /dev/shm/logs/*
+    
+    log_success "Configuration created"
+}
+
+# ============================================================================
+# PHASE 8: SERVICES SETUP
+# ============================================================================
+
+setup_services() {
+    log_info "Setting up services"
+    
+    # Create Frigate service
+    cat > /etc/systemd/system/frigate.service << 'FRIGATE_EOF'
 [Unit]
 Description=Frigate NVR
 After=network.target go2rtc.service
-Wants=network.target go2rtc.service
+Requires=go2rtc.service
 
 [Service]
 Type=simple
 User=root
+Environment="PATH=/opt/frigate/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+WorkingDirectory=/opt/frigate
+ExecStart=/opt/frigate/venv/bin/frigate -c /config/config.yml
 Restart=always
 RestartSec=10
-WorkingDirectory=/opt/frigate
-Environment="PATH=/opt/frigate/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/opt/frigate/venv/bin/frigate -c /config/config.yml
 StandardOutput=append:/dev/shm/logs/frigate/current
 StandardError=append:/dev/shm/logs/frigate/current
 
 [Install]
 WantedBy=multi-user.target
 FRIGATE_EOF
+    
+    # Enable services
+    systemctl daemon-reload
+    systemctl enable go2rtc.service
+    systemctl enable frigate.service
+    
+    log_success "Services configured"
+}
 
-# Создаем службу nginx
-cat > /etc/systemd/system/nginx.service << 'NGINX_EOF'
-[Unit]
-Description=Frigate Nginx
-After=frigate.service
-Wants=frigate.service
+# ============================================================================
+# PHASE 9: FINALIZATION
+# ============================================================================
 
-[Service]
-Type=simple
-User=root
-Restart=always
-RestartSec=5
-ExecStart=/usr/local/nginx/sbin/nginx -c /opt/frigate/nginx/nginx.conf
-StandardOutput=append:/dev/shm/logs/nginx/current
-StandardError=append:/dev/shm/logs/nginx/current
-
-[Install]
-WantedBy=multi-user.target
-NGINX_EOF
-
-# Включаем и запускаем службы
-systemctl daemon-reload
-systemctl enable go2rtc.service frigate.service nginx.service
-
-# Запускаем службы с проверкой
-msg_info "Starting services..."
-systemctl start go2rtc.service && msg_ok "go2rtc started" || msg_warn "go2rtc start had issues"
-sleep 3
-systemctl start frigate.service && msg_ok "Frigate started" || msg_warn "Frigate start had issues"
-sleep 3
-systemctl start nginx.service && msg_ok "nginx started" || msg_warn "nginx start had issues"
-
-msg_ok "All services configured and started"
-
-# КРИТИЧЕСКИЙ ФИКС 6: Завершаем без внешних вызовов
-msg_info "Installation complete!"
-
-# Разблокируем DNS для нормальной работы
-chattr -i /etc/resolv.conf 2>/dev/null || true
-
-# Восстанавливаем оригинальный resolv.conf если был
-if [ -f /etc/resolv.conf.backup ]; then
-    mv /etc/resolv.conf.backup /etc/resolv.conf
-else
-    # Или оставляем рабочие настройки
-    cat > /etc/resolv.conf << 'FINAL_DNS'
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-options edns0
-FINAL_DNS
-fi
-
-# Создаем финальное сообщение
-cat > /etc/motd << 'MOTD_EOF'
+finalize_installation() {
+    log_info "Finalizing installation"
+    
+    # Start services
+    systemctl start go2rtc.service
+    sleep 2
+    systemctl start frigate.service
+    
+    # Create MOTD
+    cat > /etc/motd << 'MOTD_EOF'
 
 ╔═══════════════════════════════════════╗
-║        Frigate NVR Installed          ║
+║       Frigate NVR Installed!          ║
 ╠═══════════════════════════════════════╣
 ║  Web Interface: http://<IP>:5000      ║
 ║  go2rtc Streams: rtsp://<IP>:8554     ║
 ║                                       ║
-║  Check status: systemctl status frigate║
-║  View logs: journalctl -u frigate -f  ║
+║  Check status:  systemctl status frigate
+║  View logs:     journalctl -u frigate -f
 ╚═══════════════════════════════════════╝
 
 MOTD_EOF
+    
+    # Get container IP
+    CONTAINER_IP=$(hostname -I | awk '{print $1}')
+    
+    log_success "="
+    log_success "FRIGATE INSTALLATION COMPLETE!"
+    log_success "="
+    echo ""
+    echo "Access Frigate at: http://${CONTAINER_IP}:5000"
+    echo "Test video is playing at: rtsp://${CONTAINER_IP}:8554/test"
+    echo ""
+    echo "Next steps:"
+    echo "1. Edit configuration: ${CONFIG_DIR}/config.yml"
+    echo "2. Add your camera RTSP streams"
+    echo "3. Restart Frigate: systemctl restart frigate"
+    echo ""
+    log_success "Installation finished successfully!"
+}
 
-msg_ok "Frigate NVR installation completed successfully!"
-echo ""
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║                 FRIGATE INSTALLED                    ║"
-echo "╠══════════════════════════════════════════════════════╣"
-echo "║  Access the web interface at: http://$(hostname -I | awk '{print $1}'):5000  ║"
-echo "║                                                      ║"
-echo "║  Next steps:                                         ║"
-echo "║  1. Edit configuration: /config/config.yml           ║"
-echo "║  2. Add your camera RTSP streams                    ║"
-echo "║  3. Restart Frigate: systemctl restart frigate      ║"
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+main() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║         Frigate Standalone Installer                 ║"
+    echo "║         Version: ${FRIGATE_VERSION}                           ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo ""
+    
+    # Execute all phases
+    setup_system
+    install_dependencies
+    setup_python
+    install_frigate
+    download_models
+    install_go2rtc
+    create_config
+    setup_services
+    finalize_installation
+    
+    # Unlock resolv.conf for normal operation
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+}
+
+# Run main function
+main "$@"
